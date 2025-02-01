@@ -7,6 +7,7 @@ public class JobConfig {
   private final String workingDir;
   private final String serverName;
   private final int port;
+  private final int tolerantMins;
 
   public JobConfig(
       String host,
@@ -14,13 +15,15 @@ public class JobConfig {
       String password,
       String workingDir,
       String serverName,
-      int port) {
+      int port,
+      int tolerantMins) {
     this.host = host;
     this.username = username;
     this.password = password;
     this.workingDir = workingDir;
     this.serverName = serverName;
     this.port = port;
+    this.tolerantMins = tolerantMins;
   }
 
   public String getHost() {
@@ -45,5 +48,9 @@ public class JobConfig {
 
   public String getServerName() {
     return serverName;
+  }
+
+  public int getTolerantMins() {
+    return tolerantMins;
   }
 }

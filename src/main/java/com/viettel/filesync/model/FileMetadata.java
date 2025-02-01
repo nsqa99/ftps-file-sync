@@ -16,4 +16,16 @@ public class FileMetadata {
   public String getLastFileName() {
     return lastFileName;
   }
+
+  @Override
+  public String toString() {
+    return "FileMetadata{"
+        + "lastDirName='"
+        + lastDirName
+        + '\''
+        + ", lastFileName='"
+        + lastFileName
+        + '\''
+        + '}';
+  }
 }

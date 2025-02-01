@@ -3,9 +3,9 @@ package com.viettel.filesync;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import com.viettel.filesync.kafka.MessageSerializer;
-import com.viettel.filesync.model.JobConfig;
 import com.viettel.filesync.model.FileInfo;
 import com.viettel.filesync.model.FileMetadata;
+import com.viettel.filesync.model.JobConfig;
 import com.viettel.filesync.model.Message;
 import java.io.*;
 import java.nio.file.Files;
@@ -14,6 +14,9 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -27,8 +30,11 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class FileSyncApp {
+  private static final Logger logger = LoggerFactory.getLogger(FileSyncApp.class);
   private static final String HDFS_SCHEME = "hdfs://vtcnamenode";
   private static final String HDFS_BASE_PATH = "/raw_zone/telecom/fake_bts/rawchr";
   private static final String DB_PATH = "jdbc:sqlite:ftps_metadata.db";
@@ -41,7 +47,7 @@ public class FileSyncApp {
   private static final DateTimeFormatter dateTimeFmt =
       DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-  public static void main(String[] args) {
+  public static void main(String[] args) throws IOException {
     String configFilePath = System.getProperty("config.file");
     Objects.requireNonNull(configFilePath);
 
@@ -54,191 +60,208 @@ public class FileSyncApp {
             config.getString("password"),
             config.getString("working-dir"),
             config.getString("server-name"),
-            config.getInt("port"));
-    KafkaProducer<String, Message> producer = null;
+            config.getInt("port"),
+            config.getInt("tolerant-minutes"));
 
-    try {
-      createMetadataTable();
+    ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(5);
+    Runnable task =
+        () -> {
+          KafkaProducer<String, Message> producer = null;
+          try (FileSystem fs = createHdfsFs()) {
+            createMetadataTable();
 
-      System.out.println("Start connecting to server");
-      List<String> directoryLines =
-          executeLftpCommand(
-              "set ftp:ssl-force true;set ftp:ssl-protect-data true;set ssl:verify-certificate false; ls "
-                  + jobConfig.getWorkingDir()
-                  + " | grep \"^d\";",
-              jobConfig);
-      if (directoryLines.isEmpty()) {
-        System.out.println("No directories found.");
-        return;
-      }
+            logger.info("Start connecting to server");
+            List<String> directoryLines =
+                executeLftpCommand(
+                    "set ftp:ssl-force true;set ftp:ssl-protect-data true;set ssl:verify-certificate false; ls "
+                        + jobConfig.getWorkingDir()
+                        + " | grep \"^d\";",
+                    jobConfig);
+            if (directoryLines.isEmpty()) {
+              logger.info("No directories found.");
+              return;
+            }
 
-      FileMetadata lastMetadata = getLatestMetadata();
-      String lastDirName = null, lastFileName = null;
-      if (lastMetadata != null) {
-        lastDirName = lastMetadata.getLastDirName();
-        lastFileName = lastMetadata.getLastFileName();
-      }
+            FileMetadata lastMetadata = getLatestMetadata();
+            logger.info("[DEBUG] Latest metadata: " + lastMetadata);
+            String lastDirName = null, lastFileName = null;
+            if (lastMetadata != null) {
+              lastDirName = lastMetadata.getLastDirName();
+              lastFileName = lastMetadata.getLastFileName();
+            }
 
-      String latestDirectory =
-          directoryLines.stream()
-              .map(FileSyncApp::extractFileName)
-              .filter(Objects::nonNull)
-              .max(String::compareTo)
-              .orElse(null);
-      if (latestDirectory == null) return;
-      System.out.println("Latest directory: " + latestDirectory);
+            String latestDirectory =
+                directoryLines.stream()
+                    .map(FileSyncApp::extractFileName)
+                    .filter(Objects::nonNull)
+                    .max(String::compareTo)
+                    .orElse(null);
+            if (latestDirectory == null) return;
+            logger.info("Latest directory: " + latestDirectory);
 
-      producer = getKafkaProducer();
+            producer = getKafkaProducer();
 
-      System.out.println("Connected to Kafka.");
+            logger.info("Connected to Kafka.");
 
-      if (lastDirName == null || lastFileName == null) {
-        // First time to run
-        List<FileInfo> files = getFileListWithTimestamps(latestDirectory, jobConfig);
-        if (files.isEmpty()) {
-          System.out.println("No files found in " + latestDirectory);
-          return;
-        }
+            if (lastDirName == null || lastFileName == null) {
+              // First time to run
+              List<FileInfo> files = getFileListWithTimestamps(latestDirectory, jobConfig);
+              if (files.isEmpty()) {
+                logger.info("No files found in " + latestDirectory);
+                return;
+              }
 
-        AtomicReference<String> newLatestFile = new AtomicReference<>("");
+              AtomicReference<String> newLatestFile = new AtomicReference<>("");
 
-        KafkaProducer<String, Message> finalProducer = producer;
-        files.stream()
-            .filter(
-                fi -> {
-                  boolean notTooLate = notTooLate(fi.getDateTime());
-                  if (!notTooLate) {
-                    System.out.println("[WARN] Skipping too old file: " + fi);
-                  }
+              KafkaProducer<String, Message> finalProducer = producer;
+              files.stream()
+                  .filter(
+                      fi -> {
+                        boolean notTooLate =
+                            notTooLate(fi.getDateTime(), jobConfig.getTolerantMins());
+                        if (!notTooLate) {
+                          logger.info("[WARN] Skipping too old file: " + fi);
+                        }
 
-                  return notTooLate;
-                })
-            .forEach(
-                file -> {
-                  String currFileNameValue = newLatestFile.get();
-                  String fileName = file.getFileName();
-                  if (currFileNameValue.isEmpty()) newLatestFile.set(fileName);
-                  else {
-                    if (currFileNameValue.compareTo(fileName) < 0) {
-                      newLatestFile.set(fileName);
+                        return notTooLate;
+                      })
+                  .forEach(
+                      file -> {
+                        String currFileNameValue = newLatestFile.get();
+                        String fileName = file.getFileName();
+                        if (currFileNameValue.isEmpty()) newLatestFile.set(fileName);
+                        else {
+                          if (currFileNameValue.compareTo(fileName) < 0) {
+                            newLatestFile.set(fileName);
+                          }
+                        }
+
+                        fetchLoadAndNotify(fs, latestDirectory, file, jobConfig, finalProducer);
+                      });
+
+              storeFileMetadata(latestDirectory, newLatestFile.get());
+            } else {
+              int compared = latestDirectory.compareTo(lastDirName);
+
+              // greatest dir scanned < saved dir
+              if (compared < 0) return;
+
+              // greatest dir scanned > saved dir
+              if (compared > 0) {
+                // Check old dir if there are files not sync
+                List<FileInfo> filesInOldDir = getFileListWithTimestamps(lastDirName, jobConfig);
+                if (!filesInOldDir.isEmpty()) {
+                  List<FileInfo> sortedOldDirFiles =
+                      filesInOldDir.stream()
+                          .sorted(Comparator.comparing(FileInfo::getFileName))
+                          .collect(Collectors.toList());
+                  Optional<FileInfo> mayLatestFile = sortedOldDirFiles.stream().findFirst();
+                  if (mayLatestFile.isPresent()) {
+                    FileInfo latestFile = mayLatestFile.get();
+                    if (latestFile.getFileName().compareTo(lastFileName) > 0) {
+                      List<String> sortedOldFileNames =
+                          sortedOldDirFiles.stream()
+                              .map(FileInfo::getFileName)
+                              .collect(Collectors.toList());
+                      // Scan and get remaining files in old directory.
+                      int fileToStart = findClosestGE(sortedOldFileNames, lastFileName);
+
+                      for (int idx = fileToStart; idx < sortedOldDirFiles.size(); idx++) {
+                        FileInfo fileName = sortedOldDirFiles.get(idx);
+                        fetchLoadAndNotify(fs, lastDirName, fileName, jobConfig, producer);
+                      }
                     }
                   }
-
-                  fetchLoadAndNotify(latestDirectory, file, jobConfig, finalProducer);
-                });
-
-        storeFileMetadata(latestDirectory, newLatestFile.get());
-      } else {
-        int compared = latestDirectory.compareTo(lastDirName);
-
-        // greatest dir scanned < saved dir
-        if (compared < 0) return;
-
-        // greatest dir scanned > saved dir
-        if (compared > 0) {
-          // Check old dir if there are files not sync
-          List<FileInfo> filesInOldDir = getFileListWithTimestamps(lastDirName, jobConfig);
-          if (!filesInOldDir.isEmpty()) {
-            List<FileInfo> sortedOldDirFiles =
-                filesInOldDir.stream()
-                    .sorted(Comparator.comparing(FileInfo::getFileName))
-                    .collect(Collectors.toList());
-            Optional<FileInfo> mayLatestFile = sortedOldDirFiles.stream().findFirst();
-            if (mayLatestFile.isPresent()) {
-              FileInfo latestFile = mayLatestFile.get();
-              if (latestFile.getFileName().compareTo(lastFileName) > 0) {
-                List<String> sortedOldFileNames =
-                    sortedOldDirFiles.stream()
-                        .map(FileInfo::getFileName)
-                        .collect(Collectors.toList());
-                // Scan and get remaining files in old directory.
-                int fileToStart = findClosestGE(sortedOldFileNames, lastFileName);
-
-                for (int idx = fileToStart; idx < sortedOldDirFiles.size(); idx++) {
-                  FileInfo fileName = sortedOldDirFiles.get(idx);
-                  fetchLoadAndNotify(lastDirName, fileName, jobConfig, producer);
                 }
+
+                // Then fetch files in the latest directory
+                List<FileInfo> files = getFileListWithTimestamps(latestDirectory, jobConfig);
+                if (files.isEmpty()) {
+                  logger.info("No files found in " + latestDirectory);
+                  return;
+                }
+
+                AtomicReference<String> newLatestFile = new AtomicReference<>("");
+
+                KafkaProducer<String, Message> finalProducer1 = producer;
+                files.stream()
+                    .filter(
+                        fi -> {
+                          boolean notTooLate =
+                              notTooLate(fi.getDateTime(), jobConfig.getTolerantMins());
+                          if (!notTooLate) {
+                            logger.info("[WARN] Skipping too old file: " + fi);
+                          }
+
+                          return notTooLate;
+                        })
+                    .forEach(
+                        file -> {
+                          String fileName = file.getFileName();
+                          String currFileNameValue = newLatestFile.get();
+                          if (currFileNameValue.isEmpty()) newLatestFile.set(fileName);
+                          else {
+                            if (currFileNameValue.compareTo(fileName) < 0) {
+                              newLatestFile.set(fileName);
+                            }
+                          }
+
+                          fetchLoadAndNotify(fs, latestDirectory, file, jobConfig, finalProducer1);
+                        });
+
+                storeFileMetadata(latestDirectory, newLatestFile.get());
+              } else {
+                // stay in the same dir
+                // only fetch file with file_name > saved file_name
+                String finalLastFileName = lastFileName;
+                AtomicReference<String> newLatestFile = new AtomicReference<>("");
+                KafkaProducer<String, Message> finalProducer2 = producer;
+                getFileListWithTimestamps(latestDirectory, jobConfig).stream()
+                    .filter(f -> f != null && f.getFileName().compareTo(finalLastFileName) > 0)
+                    .filter(
+                        fi -> {
+                          boolean notTooLate =
+                              notTooLate(fi.getDateTime(), jobConfig.getTolerantMins());
+                          if (!notTooLate) {
+                            logger.info("[WARN] Skipping too old file: " + fi);
+                          }
+
+                          return notTooLate;
+                        })
+                    .peek(
+                        validFile -> {
+                          String fileName = validFile.getFileName();
+                          if (newLatestFile.get().isEmpty()) {
+                            newLatestFile.set(fileName);
+                          } else {
+                            if (fileName.compareTo(newLatestFile.get()) > 0) {
+                              newLatestFile.set(fileName);
+                            }
+                          }
+                        })
+                    .forEach(
+                        newFile ->
+                            fetchLoadAndNotify(
+                                fs, latestDirectory, newFile, jobConfig, finalProducer2));
+
+                storeFileMetadata(lastDirName, newLatestFile.get());
               }
             }
+
+            logger.info("Process completed successfully.");
+          } catch (Exception e) {
+            logger.error("Exception when processing data", e);
+          } finally {
+            if (producer != null) producer.close();
           }
+        };
 
-          // Then fetch files in the latest directory
-          List<FileInfo> files = getFileListWithTimestamps(latestDirectory, jobConfig);
-          if (files.isEmpty()) {
-            System.out.println("No files found in " + latestDirectory);
-            return;
-          }
+    // Schedule the task to run every 5 minutes
+    long initialDelay = 0;
+    long period = 5;
+    TimeUnit unit = TimeUnit.MINUTES;
 
-          AtomicReference<String> newLatestFile = new AtomicReference<>("");
-
-          KafkaProducer<String, Message> finalProducer1 = producer;
-          files.stream()
-              .filter(
-                  fi -> {
-                    boolean notTooLate = notTooLate(fi.getDateTime());
-                    if (!notTooLate) {
-                      System.out.println("[WARN] Skipping too old file: " + fi);
-                    }
-
-                    return notTooLate;
-                  })
-              .forEach(
-                  file -> {
-                    String fileName = file.getFileName();
-                    String currFileNameValue = newLatestFile.get();
-                    if (currFileNameValue.isEmpty()) newLatestFile.set(fileName);
-                    else {
-                      if (currFileNameValue.compareTo(fileName) < 0) {
-                        newLatestFile.set(fileName);
-                      }
-                    }
-
-                    fetchLoadAndNotify(latestDirectory, file, jobConfig, finalProducer1);
-                  });
-
-          storeFileMetadata(latestDirectory, newLatestFile.get());
-        } else {
-          // stay in the same dir
-          // only fetch file with file_name > saved file_name
-          String finalLastFileName = lastFileName;
-          AtomicReference<String> newLatestFile = new AtomicReference<>("");
-          KafkaProducer<String, Message> finalProducer2 = producer;
-          getFileListWithTimestamps(latestDirectory, jobConfig).stream()
-              .filter(f -> f != null && f.getFileName().compareTo(finalLastFileName) > 0)
-              .filter(
-                  fi -> {
-                    boolean notTooLate = notTooLate(fi.getDateTime());
-                    if (!notTooLate) {
-                      System.out.println("[WARN] Skipping too old file: " + fi);
-                    }
-
-                    return notTooLate;
-                  })
-              .peek(
-                  validFile -> {
-                    String fileName = validFile.getFileName();
-                    if (newLatestFile.get().isEmpty()) {
-                      newLatestFile.set(fileName);
-                    } else {
-                      if (fileName.compareTo(newLatestFile.get()) > 0) {
-                        newLatestFile.set(fileName);
-                      }
-                    }
-                  })
-              .forEach(
-                  newFile ->
-                      fetchLoadAndNotify(latestDirectory, newFile, jobConfig, finalProducer2));
-
-          storeFileMetadata(lastDirName, newLatestFile.get());
-        }
-      }
-
-      System.out.println("Process completed successfully.");
-    } catch (Exception e) {
-      e.printStackTrace();
-    } finally {
-      if (producer != null) producer.close();
-    }
+    scheduler.scheduleWithFixedDelay(task, initialDelay, period, unit);
   }
 
   private static void sendMessage(KafkaProducer<String, Message> producer, Message message) {
@@ -247,9 +270,9 @@ public class FileSyncApp {
 
     try {
       producer.send(record);
-      System.out.println("Message sent successfully!");
+      logger.info("Message sent successfully!");
     } catch (Exception e) {
-      e.printStackTrace();
+      logger.error("Exception when sending Kafka message", e);
     }
   }
 
@@ -266,13 +289,17 @@ public class FileSyncApp {
   }
 
   private static void fetchLoadAndNotify(
-      String dirName, FileInfo file, JobConfig jobConfig, KafkaProducer<String, Message> producer) {
+      FileSystem fs,
+      String dirName,
+      FileInfo file,
+      JobConfig jobConfig,
+      KafkaProducer<String, Message> producer) {
     String fileName = file.getFileName();
     String partition = file.getPartition();
     String dateTime = file.getDateTime();
     String filePath = String.join("/", jobConfig.getWorkingDir(), dirName, fileName);
 
-    System.out.println(
+    logger.info(
         "Fetching file: "
             + fileName
             + ", path= '"
@@ -283,7 +310,6 @@ public class FileSyncApp {
             + dateTime
             + "'");
     try {
-      byte[] content = getAndLoadFileContent(filePath, jobConfig);
       String hdfsPath =
           String.join(
               "/",
@@ -291,28 +317,36 @@ public class FileSyncApp {
               "date_hour=" + partition,
               "server=" + jobConfig.getServerName(),
               fileName);
-      boolean loaded = loadToHdfs(content, HDFS_SCHEME + hdfsPath);
+      Path hdfsWritePath = new Path(HDFS_SCHEME + hdfsPath);
+
+      if (fs.exists(hdfsWritePath)) {
+        logger.warn("[WARN] File existed: '" + HDFS_SCHEME + hdfsPath + "'");
+        return;
+      }
+
+      byte[] content = getFileContent(filePath, jobConfig);
+      boolean loaded = loadToHdfs(fs, content, hdfsWritePath);
       if (loaded) {
-        System.out.println("[FTPS] File " + fileName + " is loaded to HDFS");
+        logger.info("[FTPS] File " + fileName + " is loaded to HDFS");
 
         if (producer == null) {
-          System.out.println("[Error] Found null producer, cannot send message to Kafka");
+          logger.warn("[Error] Found null producer, cannot send message to Kafka");
         } else {
           sendMessage(producer, new Message(hdfsPath, dateTime));
         }
       } else {
-        System.out.println("[Error] Failed to load file into HDFS");
+        logger.warn("[Error] Failed to load file into HDFS");
       }
     } catch (Exception e) {
       e.printStackTrace();
     }
   }
 
-  public static boolean notTooLate(String dateTime) {
+  public static boolean notTooLate(String dateTime, int tolerantMinutes) {
     LocalDateTime current = LocalDateTime.now();
     LocalDateTime inputTime = LocalDateTime.parse(dateTime, dateTimeFmt);
 
-    LocalDateTime timeWithTolerant = inputTime.plusHours(2);
+    LocalDateTime timeWithTolerant = inputTime.plusMinutes(tolerantMinutes);
 
     return timeWithTolerant.isEqual(current) || timeWithTolerant.isAfter(current);
   }
@@ -372,7 +406,7 @@ public class FileSyncApp {
   /** Retrieves file list along with last modified timestamps */
   private static List<FileInfo> getFileListWithTimestamps(String directory, JobConfig jobConfig)
       throws Exception {
-    System.out.println("Start listing file in directory: '" + directory + "'");
+    logger.info("Start listing file in directory: '" + directory + "'");
     String listCommand =
         "set ftp:ssl-force true;set ftp:ssl-protect-data true;set ssl:verify-certificate false; ls "
             + jobConfig.getWorkingDir()
@@ -383,7 +417,7 @@ public class FileSyncApp {
     List<FileInfo> files = new ArrayList<>();
 
     for (String line : output) {
-      System.out.println("[DEBUG] Processing line: " + line);
+      logger.info("[DEBUG] Processing line: " + line);
       Matcher matcher = LS_DATA_PATTERN.matcher(line);
       if (matcher.find()) {
         String dateString = matcher.group(1);
@@ -396,7 +430,7 @@ public class FileSyncApp {
                 directoryToPartition(directory, dateHourAndMinute.get("hour")),
                 directoryToDateTime(
                     directory, dateHourAndMinute.get("hour"), dateHourAndMinute.get("minute"))));
-      } else System.out.println("[Error] Skipping line not match pattern: " + line);
+      } else logger.warn("[Error] Skipping line not match pattern: " + line);
     }
 
     return files;
@@ -459,7 +493,7 @@ public class FileSyncApp {
 
       if (rs.next()) {
         String dirName = rs.getString("directory");
-        String fileName = rs.getString("filename");
+        String fileName = rs.getString("file_name");
 
         return new FileMetadata(dirName, fileName);
       }
@@ -486,7 +520,7 @@ public class FileSyncApp {
         "set ftp:ssl-force true;set ftp:ssl-protect-data true;set ssl:verify-certificate false; cat "
             + filePath
             + "; bye";
-    System.out.println("[DEBUG] Fetch command: '" + fetchCommand + "'");
+    logger.info("[DEBUG] Fetch command: '" + fetchCommand + "'");
     ProcessBuilder pb =
         new ProcessBuilder(
             "bash",
@@ -549,7 +583,7 @@ public class FileSyncApp {
         "set ftp:ssl-force true;set ftp:ssl-protect-data true;set ssl:verify-certificate false; get -O /u01/vbi_app/fake_bts/ftps-file-sync/tmp/ "
             + filePath
             + ";";
-    System.out.println("[DEBUG] Fetch command: '" + fetchCommand + "'");
+    logger.info("[DEBUG] Fetch command: '" + fetchCommand + "'");
     ProcessBuilder pb =
         new ProcessBuilder(
             "bash",
@@ -588,26 +622,16 @@ public class FileSyncApp {
 
     // Delete the file after processing
     if (!downloadedFile.delete()) {
-      System.out.println("Warning: Failed to delete the file: " + downloadedFile.getAbsolutePath());
+      logger.warn("Warning: Failed to delete the file: " + downloadedFile.getAbsolutePath());
     }
 
     return fileContent;
   }
 
   /** Saves content to HDFS */
-  private static boolean loadToHdfs(byte[] content, String path) throws Exception {
-    Configuration conf = new Configuration();
-    conf.addResource(new Path("/etc/hadoop/3.1.4.0-315/0/core-site.xml"));
-    conf.addResource(new Path("/etc/hadoop/3.1.4.0-315/0/hdfs-site.xml"));
-    conf.set("fs.hdfs.impl", org.apache.hadoop.hdfs.DistributedFileSystem.class.getName());
-    conf.set("fs.file.impl", org.apache.hadoop.fs.LocalFileSystem.class.getName());
-    FileSystem fs = FileSystem.get(conf);
-    Path hdfsWritePath = new Path(path);
-    System.out.println("[DEBUG] File will be load into HDFS with path = '" + hdfsWritePath + "'");
-    if (fs.exists(hdfsWritePath)) {
-      System.out.println("[WARN] File existed: '" + path + "'");
-      return false;
-    }
+  private static boolean loadToHdfs(FileSystem fs, byte[] content, Path hdfsWritePath)
+      throws Exception {
+    logger.info("File will be load into HDFS with path = '" + hdfsWritePath + "'");
 
     try (FSDataOutputStream os = fs.create(hdfsWritePath)) {
       os.write(content);
@@ -616,5 +640,15 @@ public class FileSyncApp {
     if (fileExists) fs.setOwner(hdfsWritePath, "vbi_app", "vbi_app");
 
     return fileExists;
+  }
+
+  private static FileSystem createHdfsFs() throws IOException {
+    Configuration conf = new Configuration();
+    conf.addResource(new Path("/etc/hadoop/3.1.4.0-315/0/core-site.xml"));
+    conf.addResource(new Path("/etc/hadoop/3.1.4.0-315/0/hdfs-site.xml"));
+    conf.set("fs.hdfs.impl", org.apache.hadoop.hdfs.DistributedFileSystem.class.getName());
+    conf.set("fs.file.impl", org.apache.hadoop.fs.LocalFileSystem.class.getName());
+
+    return FileSystem.get(conf);
   }
 }
