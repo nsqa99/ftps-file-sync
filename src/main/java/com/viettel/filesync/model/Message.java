@@ -4,14 +4,10 @@ import org.codehaus.jackson.annotate.JsonProperty;
 
 public class Message {
   private String path;
-  private String partition;
-  private String fileName;
   private String dateTime;
 
-  public Message(String path, String partition, String fileName, String dateTime) {
+  public Message(String path, String dateTime) {
     this.path = path;
-    this.partition = partition;
-    this.fileName = fileName;
     this.dateTime = dateTime;
   }
 
@@ -22,17 +18,7 @@ public class Message {
     return path;
   }
 
-  @JsonProperty("partition")
-  public String getPartition() {
-    return partition;
-  }
-
-  @JsonProperty("fileName")
-  public String getFileName() {
-    return fileName;
-  }
-
-  @JsonProperty("dateTime")
+  @JsonProperty("dateTimeString")
   public String getDateTime() {
     return dateTime;
   }

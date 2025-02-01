@@ -6,6 +6,7 @@ import org.apache.kafka.common.serialization.Serializer;
 
 public class MessageSerializer implements Serializer<Message> {
   private final ObjectMapper objectMapper = new ObjectMapper();
+
   @Override
   public byte[] serialize(String s, Message message) {
     try {

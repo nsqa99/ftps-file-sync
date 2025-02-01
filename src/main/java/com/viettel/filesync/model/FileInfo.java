@@ -22,4 +22,9 @@ public class FileInfo {
   public String getDateTime() {
     return dateTime;
   }
+
+  @Override
+  public String toString() {
+    return "FileInfo{" + "fileName='" + fileName + '\'' + ", dateTime='" + dateTime + '\'' + '}';
+  }
 }
